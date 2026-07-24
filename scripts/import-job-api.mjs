@@ -2,6 +2,12 @@ import { randomUUID } from "node:crypto";
 import { copyFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import sharp from "sharp";
+import {
+  codexAnalyze,
+  codexGenerateImage,
+  inspectCodex,
+  selectImportProvider,
+} from "./codex-local-adapter.mjs";
 
 const API_ROOT = "/api/import/jobs";
 const ASSET_ROOT = "/api/import/assets";
@@ -16,6 +22,14 @@ function json(res, status, value) {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Cache-Control", "no-store");
   res.end(JSON.stringify(value));
+}
+
+function isLoopbackAddress(address = "") {
+  const normalized = String(address).toLowerCase().split("%")[0];
+  return normalized === "127.0.0.1"
+    || normalized === "::1"
+    || normalized === "::ffff:127.0.0.1"
+    || normalized.startsWith("127.");
 }
 
 async function body(req, limit = 25 * 1024 * 1024) {
@@ -346,11 +360,30 @@ export function wardrobeImportApi(options = {}) {
   let importedFile;
   let libraryAssetDir;
   const running = new Map();
+  let codexStatusCache = null;
   const setting = (name, fallback = "") => options.env?.[name] || process.env[name] || fallback;
   const apiBaseUrl = () => setting("OPENAI_API_BASE_URL", "https://api.openai.com/v1").replace(/\/$/, "");
 
+  async function localCodexStatus(force = false) {
+    const maxAge = 10_000;
+    if (!force && codexStatusCache && Date.now() - codexStatusCache.checkedAt < maxAge) {
+      return codexStatusCache.value;
+    }
+    const value = await inspectCodex({
+      bin: setting("WARDROBE_CODEX_BIN", "codex"),
+      timeoutMs: Number(setting("WARDROBE_CODEX_STATUS_TIMEOUT_MS", "8000")),
+    });
+    codexStatusCache = { checkedAt: Date.now(), value };
+    return value;
+  }
+
   async function setupStatus() {
     const hasApiKey = Boolean(setting("OPENAI_API_KEY").trim());
+    const preference = setting("WARDROBE_IMPORT_PROVIDER", "auto");
+    const codex = preference.trim().toLowerCase() === "api"
+      ? { available: false, authenticated: false, version: null, authMode: null, error: null, skipped: true }
+      : await localCodexStatus();
+    const selected = selectImportProvider({ preference, codexStatus: codex, hasApiKey });
     const referenceSetting = setting("WARDROBE_MODEL_REFERENCE", "data/model-reference.png");
     const referencePath = path.resolve(root, referenceSetting);
     let hasModelReference = false;
@@ -360,10 +393,17 @@ export function wardrobeImportApi(options = {}) {
       if (error.code !== "ENOENT") throw error;
     }
     return {
-      ready: hasApiKey && hasModelReference,
+      ready: selected.ready && hasModelReference,
+      providerReady: selected.ready,
+      provider: selected.provider,
+      fallbackProvider: selected.fallback,
+      providerPreference: preference,
+      providerError: selected.error,
       hasApiKey,
+      codex,
       hasModelReference,
       modelReference: referenceSetting,
+      localOnly: true,
     };
   }
 
@@ -434,15 +474,27 @@ export function wardrobeImportApi(options = {}) {
       try {
         const dir = path.join(jobsDir, current.id);
         const output = path.join(dir, `${stageName}-${stage.attempts}.png`);
+        const setup = await setupStatus();
+        if (!setup.ready) throw new Error(setup.providerError || "Wardrobe importer setup is incomplete");
         const key = setting("OPENAI_API_KEY");
-        if (!key) throw new Error("OPENAI_API_KEY is not configured");
         const sourceFile = stageName === "garment" && current.internal.cropFile ? current.internal.cropFile : current.internal.originalFile;
         const original = { data: await readFile(path.join(dir, sourceFile)), mime: "image/png", name: sourceFile };
         let bytes;
         if (stageName === "garment") {
           chromaKeyUsed = chooseChromaKey(current.metadata.color);
           const basePrompt = options.garmentPrompt || buildGarmentPrompt(current.metadata, chromaKeyUsed);
-          bytes = await openAIEdit({ key, baseUrl: apiBaseUrl(), model: setting("OPENAI_GARMENT_MODEL", setting("OPENAI_IMAGE_MODEL", "gpt-image-2")), quality: setting("OPENAI_IMAGE_QUALITY", "high"), size: "1024x1024", images: [original], prompt: current.stages.garment.prompt ? `${basePrompt}\nUser regeneration direction: ${current.stages.garment.prompt}` : basePrompt });
+          const prompt = current.stages.garment.prompt ? `${basePrompt}\nUser regeneration direction: ${current.stages.garment.prompt}` : basePrompt;
+          bytes = setup.provider === "codex"
+            ? await codexGenerateImage({
+              bin: setting("WARDROBE_CODEX_BIN", "codex"),
+              images: [path.join(dir, sourceFile)],
+              prompt: `${prompt}\nInput images: Image 1 is the exact source garment reference.\nFinal PNG dimensions must be exactly 1024 by 1024 pixels.`,
+              outputPath: output,
+              workdir: dir,
+              model: setting("WARDROBE_CODEX_MODEL") || undefined,
+              timeoutMs: Number(setting("WARDROBE_CODEX_IMAGE_TIMEOUT_MS", "300000")),
+            })
+            : await openAIEdit({ key, baseUrl: apiBaseUrl(), model: setting("OPENAI_GARMENT_MODEL", setting("OPENAI_IMAGE_MODEL", "gpt-image-2")), quality: setting("OPENAI_IMAGE_QUALITY", "high"), size: "1024x1024", images: [original], prompt });
           const rawName = `${stageName}-${stage.attempts}-source.png`;
           await writeFile(path.join(dir, rawName), bytes);
           failedAssetUrl = `${ASSET_ROOT}/${current.id}/${rawName}`;
@@ -463,7 +515,19 @@ export function wardrobeImportApi(options = {}) {
           }
           const model = { data: modelData, mime: "image/png", name: "model.png" };
           const basePrompt = options.modeledPrompt || "Create a professional horizontal 3:2 editorial fashion photograph of the person in Image 1 wearing the exact garment from Image 2. Preserve the person's recognizable identity, face, hair, age and proportions. Preserve every garment color, material, fit, construction, graphic, logo and distinctive detail. Keep the complete featured item clearly visible and unobstructed, use understated neutral supporting clothes, realistic anatomy, natural light, authentic fabric, a tasteful real-world setting, and leave environmental space around the model. No text, watermark, product mockup, or synthetic appearance.";
-          bytes = await openAIEdit({ key, baseUrl: apiBaseUrl(), model: setting("OPENAI_MODELED_MODEL", setting("OPENAI_IMAGE_MODEL", "gpt-image-2")), quality: setting("OPENAI_IMAGE_QUALITY", "high"), size: "1536x1024", images: [model, garment], prompt: current.stages.modeled.prompt ? `${basePrompt}\nUser regeneration direction: ${current.stages.modeled.prompt}` : basePrompt });
+          const prompt = current.stages.modeled.prompt ? `${basePrompt}\nUser regeneration direction: ${current.stages.modeled.prompt}` : basePrompt;
+          bytes = setup.provider === "codex"
+            ? await codexGenerateImage({
+              bin: setting("WARDROBE_CODEX_BIN", "codex"),
+              images: [modelPath, garmentFile],
+              prompt: `${prompt}\nInput images: Image 1 is the person's identity reference. Image 2 is the exact featured garment.\nFinal PNG dimensions must be exactly 1536 by 1024 pixels.`,
+              outputPath: output,
+              workdir: dir,
+              model: setting("WARDROBE_CODEX_MODEL") || undefined,
+              timeoutMs: Number(setting("WARDROBE_CODEX_IMAGE_TIMEOUT_MS", "300000")),
+            })
+            : await openAIEdit({ key, baseUrl: apiBaseUrl(), model: setting("OPENAI_MODELED_MODEL", setting("OPENAI_IMAGE_MODEL", "gpt-image-2")), quality: setting("OPENAI_IMAGE_QUALITY", "high"), size: "1536x1024", images: [model, garment], prompt });
+          bytes = await sharp(bytes).resize(1536, 1024, { fit: "cover", position: "centre" }).png().toBuffer();
         }
         await writeFile(output, bytes);
         const fresh = await loadJob(current.id);
@@ -490,6 +554,9 @@ export function wardrobeImportApi(options = {}) {
   async function handler(req, res, next) {
     const url = new URL(req.url, "http://localhost");
     if (!url.pathname.startsWith("/api/import/")) return next();
+    if (!isLoopbackAddress(req.socket?.remoteAddress)) {
+      return json(res, 403, { error: "Wardrobe import is available only from this machine" });
+    }
     try {
       if (url.pathname === "/api/import/wardrobe" && req.method === "GET") {
         return json(res, 200, await loadImported());
@@ -530,16 +597,24 @@ export function wardrobeImportApi(options = {}) {
         const setup = await setupStatus();
         if (!setup.ready) {
           const missing = [
-            !setup.hasApiKey && "OPENAI_API_KEY in .env",
+            !setup.providerReady && (setup.providerError || "a signed-in Codex session or OPENAI_API_KEY"),
             !setup.hasModelReference && `a PNG photo of yourself at ${setup.modelReference}`,
           ].filter(Boolean).join(" and ");
-          return json(res, 503, { error: `Setup required: add ${missing}, then restart the app.` });
+          return json(res, 503, { error: `Setup required: add ${missing || "a usable import provider"}, then restart the app.` });
         }
         const input = await body(req);
         const image = decodeImage(input);
         const normalizedImage = await normalizeImage(image.data);
         const key = setting("OPENAI_API_KEY");
-        const detected = (await openAIAnalyze({ key, baseUrl: apiBaseUrl(), model: setting("OPENAI_VISION_MODEL", "gpt-5.4-mini"), image: normalizedImage, mime: "image/png" })).map(normalizeMetadata);
+        const detectedItems = setup.provider === "codex"
+          ? await codexAnalyze({
+            bin: setting("WARDROBE_CODEX_BIN", "codex"),
+            image: normalizedImage,
+            model: setting("WARDROBE_CODEX_MODEL") || undefined,
+            timeoutMs: Number(setting("WARDROBE_CODEX_ANALYSIS_TIMEOUT_MS", "120000")),
+          })
+          : await openAIAnalyze({ key, baseUrl: apiBaseUrl(), model: setting("OPENAI_VISION_MODEL", "gpt-5.4-mini"), image: normalizedImage, mime: "image/png" });
+        const detected = detectedItems.map(normalizeMetadata);
         const jobs = [];
         for (const metadata of detected) {
           const id = randomUUID();
